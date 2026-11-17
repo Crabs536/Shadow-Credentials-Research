@@ -1,0 +1,214 @@
+# Shadow Credentials trong Active Directory
+
+*Exploitation, Persistence, Authentication Abuse & Detection*
+
+## Tổng quan
+
+**Shadow Credentials** là một kỹ thuật lạm dụng cơ chế xác thực bằng khóa công khai trong **Active Directory (AD)**. Nếu một tài khoản có quyền ghi không phù hợp lên đối tượng AD của tài khoản khác, kẻ tấn công có thể liên kết thêm một **Key Credential** mới với tài khoản mục tiêu. Khi môi trường hỗ trợ **Kerberos PKINIT**, khóa này có thể bị lợi dụng để yêu cầu **TGT (Ticket-Granting Ticket)** mà không cần biết mật khẩu gốc của nạn nhân.
+
+Điểm nguy hiểm của kỹ thuật này không nằm ở việc phá vỡ Kerberos, mà nằm ở **misconfigured ACL** và **đường xác thực thay thế dựa trên public key**. Nếu thay đổi này không được phát hiện và gỡ bỏ, nó có thể trở thành một cơ chế **persistence** trên danh tính.
+
+![Mô hình tổng quan của Shadow Credentials](images/05-mechanism-overview.png)
+
+## 1. Điều kiện và môi trường thực nghiệm
+
+Môi trường lab được xây dựng để kiểm chứng chuỗi tấn công trong điều kiện kiểm soát:
+
+| Thành phần | Vai trò |
+|---|---|
+| Windows Server 2022 | Domain Controller, vận hành AD DS và Kerberos KDC |
+| `lab.domain` | Domain nội bộ của môi trường lab |
+| `lab_user` | Tài khoản quyền thấp, được cấp quyền ghi sai trên đối tượng mục tiêu |
+| `victim_admin` | Tài khoản mục tiêu có quyền cao trong domain |
+| Kali Linux | Máy thực hiện kiểm thử và quan sát kết quả |
+
+Điều kiện tiên quyết của kỹ thuật là một tài khoản như `lab_user` có **GenericWrite / GenericAll / WriteProperty** trên đối tượng của `victim_admin` hoặc đối tượng tương đương. Đây là phần mở đầu quan trọng vì nếu không có quyền ghi phù hợp, chuỗi Shadow Credentials không thể bắt đầu.
+
+## 2. Cơ chế kỹ thuật cốt lõi
+
+### 2.1. `msDS-KeyCredentialLink`
+
+`msDS-KeyCredentialLink` là thuộc tính dùng để lưu **Key Credential** gắn với đối tượng AD. Trong các triển khai như **Windows Hello for Business (WHfB)**, thuộc tính này giúp hệ thống ánh xạ danh tính với public key phục vụ xác thực không dùng mật khẩu.
+
+Nếu một đối tượng không được phép nhưng vẫn có thể sửa thuộc tính này, kẻ tấn công có thể cài một public key do chính mình kiểm soát.
+
+### 2.2. PKINIT và TGT
+
+**PKINIT (Public Key Cryptography for Initial Authentication in Kerberos)** là mở rộng của Kerberos cho phép client chứng minh danh tính bằng khóa/certificate thay vì mật khẩu. Khi KDC chấp nhận quá trình xác thực, nó sẽ cấp **TGT**. Từ đây, TGT có thể được dùng tiếp trong các bước truy cập dịch vụ hoặc hoạt động hậu khai thác tùy theo ngữ cảnh.
+
+## 3. Exploitation — chi tiết chuỗi khai thác trong lab
+
+Phần này trình bày lại chuỗi thực nghiệm theo logic của một báo cáo kỹ thuật độc lập. Các hình minh họa thể hiện trực tiếp đầu ra của từng giai đoạn thử nghiệm. Ảnh được giữ đầy đủ nội dung; các đường viền đỏ chỉ giúp xác định nhanh vùng lệnh và kết quả liên quan.
+
+### 3.1. Xác nhận misconfiguration trên đối tượng mục tiêu
+
+Trước khi khai thác, cần xác định rằng đối tượng mục tiêu đang bị cấp quyền sai. Trong lab, `lab_user` có quyền ghi lên tài khoản `victim_admin`. Đây chính là điều kiện cốt lõi cho phép thao tác lên dữ liệu xác thực của nạn nhân.
+
+Giao diện **Security** của đối tượng `victim_admin` cho thấy `lab-user` nằm trong danh sách được phân quyền, đồng thời quyền **Write** đang được cho phép. Quyền ghi này là điểm khởi đầu của kịch bản lạm dụng thuộc tính xác thực trong Active Directory.
+
+![Misconfigured ACL trên tài khoản mục tiêu](images/00-ad-acl-misconfiguration.png)
+
+### 3.2. Bước 1 — chèn Shadow Credential vào tài khoản mục tiêu
+
+Ở bước đầu tiên, công cụ **pyWhisker** được dùng để sinh cặp khóa và ghi dữ liệu Key Credential vào `msDS-KeyCredentialLink` của `victim_admin`.
+
+```bash
+python3 pywhisker.py -d "lab.domain" -u "lab_user" -p "<LAB_PASSWORD>"   -target "victim_admin" --action "add" --filename "hacked_cert"
+```
+
+Kết quả thực nghiệm thể hiện pyWhisker xác định được đối tượng `victim_admin`, tạo **Key Credential** với một **DeviceID**, ghi nhận việc cập nhật thuộc tính `msDS-KeyCredentialLink` và lưu dữ liệu chứng chỉ/khóa dưới dạng `hacked_cert.pfx`. Đây là bằng chứng cho thấy dữ liệu xác thực dựa trên khóa của tài khoản mục tiêu đã thay đổi.
+
+**Về giao thức / API:** bước này chủ yếu tác động tới **Active Directory qua LDAP** để sửa thuộc tính đối tượng. Ở góc nhìn hệ thống, đây không phải “phá” Kerberos, mà là **thêm một Key Credential trái phép** vào dữ liệu danh tính của tài khoản mục tiêu.
+
+![Chèn Shadow Credential bằng pyWhisker](images/01-shadow-credential-addition.png)
+
+### 3.3. Bước 2 — yêu cầu TGT qua xác thực PKINIT
+
+Sau khi đã có `.pfx`, bước tiếp theo là dùng **gettgtpkinit.py** để gửi yêu cầu Kerberos ban đầu theo cơ chế PKINIT tới Domain Controller.
+
+```bash
+python3 gettgtpkinit.py -cert-pfx hacked_cert.pfx -pfx-pass "<PFX_PASSWORD>"   lab.domain/victim_admin victim_admin.ccache
+```
+
+Công cụ **gettgtpkinit.py** sử dụng dữ liệu chứng chỉ/khóa trong file `.pfx` để yêu cầu xác thực Kerberos bằng **PKINIT**. Dòng kết quả ghi nhận **AS-REP encryption key** và thông báo đã lưu **TGT** vào file `victim_admin.ccache`, xác nhận giai đoạn yêu cầu vé Kerberos trong lab hoàn tất.
+
+**Về giao thức / API:** bước này đi qua **Kerberos AS-REQ / AS-REP** với phần mở rộng **PKINIT**. Thành phần xử lý phía máy chủ là **KDC** trên Domain Controller.
+
+![Yêu cầu TGT bằng PKINIT](images/02-pkinit-tgt-request.png)
+
+### 3.4. Bước 3 — trích xuất NTLM hash từ dữ liệu xác thực thu được
+
+Sau khi đã có TGT và khóa liên quan từ bước trước, bước tiếp theo trong lab là dùng **getnthash.py** để phục hồi **NTLM hash** của tài khoản mục tiêu.
+
+```bash
+export KRB5CCNAME=$(pwd)/victim_admin.ccache
+python3 getnthash.py -key <AS_REP_KEY> lab.domain/victim_admin
+```
+
+Đầu ra cho thấy công cụ truy cập **Kerberos ticket cache**, thực hiện thao tác liên quan đến **PAC** và hiển thị dòng `Recovered NT Hash`. Điều này minh họa mức độ ảnh hưởng khi một Key Credential bị gắn vào sai danh tính, vượt khỏi phạm vi thay đổi thuộc tính đơn thuần.
+
+**Về kỹ thuật:** bước này gắn với quá trình xử lý dữ liệu Kerberos/PAC trong bối cảnh công cụ nghiên cứu. Điều quan trọng ở góc độ phòng thủ là: một thay đổi ban đầu trên `msDS-KeyCredentialLink` có thể dẫn tới việc nạn nhân bị mạo danh và chuỗi hậu quả không còn dừng ở “đăng nhập bằng khóa”.
+
+![Trích xuất NTLM hash](images/03-getnthash-result.png)
+
+### 3.5. Bước 4 — kiểm chứng quyền truy cập từ xa
+
+Sau khi có dữ liệu xác thực phù hợp, lab dùng **Evil-WinRM** để kiểm chứng khả năng truy cập từ xa dưới ngữ cảnh của `victim_admin`.
+
+```bash
+evil-winrm -i 192.168.56.145 -u victim_admin -H <NT_HASH>
+```
+
+Phiên **WinRM** trong lab được thiết lập và lệnh `whoami` trả về danh tính `lab\victim_admin`. Kết quả xác nhận ngữ cảnh người dùng của phiên quản trị từ xa, không tự chứng minh rằng mọi dịch vụ trong domain đều có thể bị truy cập.
+
+**Về giao thức / API:** ở giai đoạn này, hoạt động truy cập từ xa dùng **WinRM / WS-Management**. Đây là lớp sau xác thực — tức là sau khi danh tính đã bị mạo danh thành công.
+
+![Phiên WinRM dưới ngữ cảnh victim_admin](images/04-evil-winrm-session.png)
+
+### 3.6. Quan sát hậu khai thác trong lab
+
+Sau khi có phiên truy cập, lab tiếp tục ghi nhận một số hành vi để minh họa tác động của việc chiếm quyền. Các bước này chỉ mang tính **xác minh khả năng thao tác** trong môi trường thử nghiệm.
+
+#### a) Liệt kê danh tính trong hệ thống
+
+Sử dụng `Get-ADUser` để liệt kê tài khoản trong domain và `Get-LocalUser` để liệt kê người dùng cục bộ. Kết quả hiển thị các tên tài khoản và trạng thái **Enabled**, cho thấy phiên shell có thể truy vấn thông tin danh tính trong hệ thống.
+
+![Liệt kê người dùng trên hệ thống](images/05-post-list-users.png)
+
+#### b) Tạo file để xác minh khả năng ghi dữ liệu
+
+Sử dụng PowerShell tạo một file thử nghiệm trên ổ đĩa rồi đọc lại nội dung. File xuất hiện trong kết quả liệt kê và dữ liệu được đọc thành công, chứng minh phiên truy cập có quyền **ghi và đọc** tại đường dẫn thử nghiệm.
+
+![Tạo file dưới ngữ cảnh victim_admin](images/06-post-create-file.png)
+
+#### c) Thao tác với Windows Defender
+
+Ảnh ghi nhận các thao tác thay đổi cấu hình **Microsoft Defender** trong lab; kết quả kiểm tra hiển thị `RealTimeProtectionEnabled` và `BehaviorMonitorEnabled` ở trạng thái `False`. Điều này minh họa tác động tiềm tàng tới cơ chế bảo vệ endpoint sau khi một phiên có đặc quyền cao bị lạm dụng.
+
+![Thao tác với Windows Defender](images/07-post-disable-defender.png)
+
+#### d) Xóa hoặc làm rối telemetry sự kiện
+
+Ảnh thể hiện thao tác được thực hiện với **Windows Event Log** và truy vấn tìm Event ID `4768`. Truy vấn trả về `NoMatchingEventsFound`, tức là **không tìm thấy sự kiện phù hợp** tại thời điểm kiểm tra; riêng kết quả này chưa đủ để chứng minh tất cả log đã bị xóa. Đây là hoạt động cần giám sát vì nó có thể làm giảm khả năng điều tra và truy vết.
+
+![Thao tác liên quan event log](images/08-post-log-clear.png)
+
+### 3.7. Tóm tắt chuỗi khai thác
+
+Chuỗi thực nghiệm trong lab có thể tóm lược như sau:
+
+1. Có **misconfigured ACL** trên đối tượng AD của tài khoản đặc quyền.
+2. Dùng **pyWhisker** để thêm **Shadow Credential** vào `msDS-KeyCredentialLink`.
+3. Dùng **PKINIT** để yêu cầu **TGT** dưới danh tính nạn nhân.
+4. Từ dữ liệu xác thực thu được, phục hồi thêm thông tin phục vụ hậu khai thác trong lab.
+5. Kiểm chứng truy cập từ xa và quan sát tác động khi shell chạy dưới ngữ cảnh của tài khoản mục tiêu.
+
+## 4. Persistence — vì sao đổi mật khẩu có thể chưa đủ?
+
+Bản chất persistence của Shadow Credentials nằm ở chỗ **Key Credential trái phép vẫn tồn tại trên đối tượng AD** cho đến khi bị xóa hoặc bị thay thế theo quy trình kiểm soát phù hợp. Do đó, ngay cả khi nạn nhân đổi mật khẩu, đường xác thực dựa trên khóa vẫn có thể còn hiệu lực nếu hệ thống vẫn chấp nhận khóa đó.
+
+![Cơ chế persistence bằng Key Credential](images/06-persistence-model.png)
+
+| Tình huống | Ý nghĩa |
+|---|---|
+| Đổi mật khẩu | Không tự động xóa Key Credential đã bị cài trái phép |
+| Chỉ thu hồi TGT phiên hiện tại | Chưa chắc xử lý tận gốc nếu Key Credential vẫn còn trong AD |
+| Xóa Key Credential trái phép | Mới xử lý trực tiếp đường xác thực bằng khóa |
+| Thu hồi ACL sai | Giảm nguy cơ bị cài lại Shadow Credential trong tương lai |
+
+## 5. Công cụ, giao thức và API liên quan
+
+| Thành phần | Vai trò | Giao thức / API liên quan |
+|---|---|---|
+| **pyWhisker** | Thêm / sửa Key Credential trên đối tượng AD | LDAP |
+| **gettgtpkinit.py** | Yêu cầu TGT bằng certificate / private key | Kerberos PKINIT |
+| **getnthash.py** | Làm việc với dữ liệu Kerberos trong bối cảnh nghiên cứu | Kerberos / PAC processing |
+| **Evil-WinRM** | Truy cập shell từ xa | WinRM / WS-Man |
+| **PowerShell cmdlets** | Quan sát hoặc thao tác hệ thống sau khi đã có phiên | PowerShell, .NET, Windows management stack |
+| **Windows Event Log** | Ghi nhận đăng nhập, thay đổi đối tượng và telemetry khác | Event Log APIs |
+
+**Ghi chú:** ở đây “API” nên hiểu rộng là **giao diện / cơ chế kỹ thuật mà công cụ sử dụng**, ví dụ LDAP cho AD, Kerberos cho cấp vé, WinRM cho remote management và Event Log cho quan sát hệ thống.
+
+## 6. Bypass / defensive blind spots
+
+Trong ngữ cảnh Shadow Credentials, “bypass” không nên hiểu là phá cơ chế mã hóa, mà là **vượt qua giả định phòng thủ**. Một số khoảng trống thường gặp:
+
+1. **Bypass giả định chỉ cần bảo vệ mật khẩu**: tài khoản có thể bị mạo danh qua public-key authentication mà không cần đổi mật khẩu.
+2. **Bypass do ACL sai**: quyền ghi sai trên đối tượng AD mở đường cho việc cài Key Credential trái phép.
+3. **Bypass sau password reset**: nếu chỉ đổi mật khẩu mà không rà soát `msDS-KeyCredentialLink`, đường truy cập bằng khóa có thể còn tồn tại.
+4. **Bypass monitoring**: nếu chưa bật đầy đủ auditing/SACL hoặc không theo dõi thay đổi thuộc tính AD, việc chèn Key Credential có thể bị bỏ sót.
+5. **Defense evasion sau khai thác**: khi đã có ngữ cảnh mạnh, đối tượng tấn công có thể thử giảm hiệu quả giám sát như thao tác log hoặc thay đổi cấu hình bảo vệ.
+
+## 7. Detection và điều tra
+
+![Các điểm quan sát và phát hiện](images/07-defensive-telemetry.png)
+
+| Nguồn sự kiện | Mục đích quan sát |
+|---|---|
+| Event ID 5136 | Theo dõi thay đổi thuộc tính đối tượng AD, đặc biệt là `msDS-KeyCredentialLink` |
+| Event ID 4768 | Quan sát yêu cầu Kerberos TGT và bối cảnh xác thực |
+| Event ID 4624 | Quan sát phiên đăng nhập thành công trên host |
+| WinRM / PowerShell logging | Ghi nhận hoạt động quản trị từ xa và lệnh được thực thi |
+| Event ID 1102 | Dấu hiệu log bị xóa |
+
+Khi điều tra, nên trả lời ít nhất các câu hỏi sau:
+
+- Ai đã sửa `msDS-KeyCredentialLink`?
+- Tài khoản bị sửa có phải tài khoản nhạy cảm không?
+- Có yêu cầu Kerberos bất thường ngay sau thay đổi thuộc tính không?
+- Có phiên WinRM / PowerShell bất thường liên quan tới tài khoản đó không?
+- Có dấu hiệu defense evasion hoặc xóa telemetry sau khi truy cập thành công không?
+
+## 8. Mitigation
+
+1. Rà soát và gỡ bỏ **GenericWrite / GenericAll / WriteProperty** không cần thiết trên các đối tượng nhạy cảm.
+2. Kiểm soát chặt việc triển khai **WHfB / Key Trust / certificate-based authentication**.
+3. Giám sát thay đổi với `msDS-KeyCredentialLink` và các sự kiện Kerberos liên quan.
+4. Khi xử lý sự cố, không chỉ đổi mật khẩu mà còn phải **kiểm tra và thu hồi Key Credential bất thường**.
+5. Tăng cường logging cho Domain Controller, WinRM và PowerShell.
+
+## 9. Kết luận
+
+Shadow Credentials cho thấy rằng một sai sót nhỏ trong phân quyền Active Directory có thể dẫn tới một chuỗi tác động rất lớn: từ việc chỉnh sửa thuộc tính danh tính, yêu cầu vé Kerberos, mạo danh tài khoản đặc quyền cho tới duy trì truy cập lâu dài.
+
+Bài học quan trọng nhất là: **bảo vệ mật khẩu là chưa đủ**. Trong các môi trường AD hiện đại, việc kiểm soát quyền ghi trên đối tượng, vòng đời Key Credential và telemetry xác thực có ý nghĩa quyết định trong việc phòng chống kỹ thuật này.

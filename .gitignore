@@ -1,0 +1,14 @@
+# Local test outputs / caches
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+.env
+.venv/
+venv/
+*.ccache
+*.pfx
+*.key
+*.pem
+*.kirbi
